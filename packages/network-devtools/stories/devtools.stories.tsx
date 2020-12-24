@@ -20,7 +20,7 @@ export default {
 
 const createPeer = async (controlTopic: PublicKey, peerId: PublicKey, topologyFactory: () => Topology) => {
   const networkManager = new NetworkManager({
-    signal: ['wss://apollo1.kube.moon.dxos.network/dxos/signal']
+    signal: ['wss://apollo1.kube.moon.dxos.network/dxos/signal', 'wss://apollo2.kube.moon.dxos.network/dxos/signal']
   });
   const presencePlugin = new Presence(peerId.asBuffer());
   networkManager.joinProtocolSwarm({

@@ -2,12 +2,11 @@
 // Copyright 2020 DXOS.org
 //
 
-import assert from 'assert';
 import debug from 'debug';
 
 import { Event, synchronized } from '@dxos/async';
 import { PublicKey } from '@dxos/crypto';
-import { ComplexMap } from '@dxos/util';
+import { ComplexMap, ComplexSet } from '@dxos/util';
 
 import { SignalManager } from './interface';
 import { SignalApi } from './signal-api';
@@ -22,6 +21,9 @@ export class WebsocketSignalManager implements SignalManager {
 
   private readonly _topicsJoinedPerSignal = new Map<string, ComplexMap<PublicKey, PublicKey>>();
 
+  /** host => topic => peers */
+  private readonly _peerCandidates = new Map<string, ComplexMap<PublicKey, ComplexSet<PublicKey>>>();
+
   private _reconcileTimeoutId?: NodeJS.Timeout;
 
   readonly statusChanged = new Event<SignalApi.Status[]>();
@@ -33,7 +35,6 @@ export class WebsocketSignalManager implements SignalManager {
     private readonly _onOffer: (message: SignalApi.SignalMessage) => Promise<SignalApi.Answer>
   ) {
     log(`Created WebsocketSignalManager with signal servers: ${_hosts}`);
-    assert(_hosts.length === 1, 'Only a single signaling server connection is supported');
     for (const host of this._hosts) {
       const server = new SignalApi(
         host,
@@ -46,6 +47,7 @@ export class WebsocketSignalManager implements SignalManager {
       server.statusChanged.on(() => this.statusChanged.emit(this.getStatus()));
       server.commandTrace.on(trace => this.commandTrace.emit(trace));
       this._topicsJoinedPerSignal.set(host, new ComplexMap(x => x.toHex()));
+      this._peerCandidates.set(host, new ComplexMap(x => x.toHex()));
     }
   }
 
@@ -73,14 +75,15 @@ export class WebsocketSignalManager implements SignalManager {
       for (const [topic, peerId] of this._topicsJoined.entries()) {
         if (!this._topicsJoinedPerSignal.get(host)!.has(topic)) {
           log(`Join ${topic} as ${peerId} on ${host}`);
+          if(!this._peerCandidates.get(host)!.has(topic)) {
+            this._peerCandidates.get(host)!.set(topic, new ComplexSet(x => x.toHex()));
+          }
           promises.push(server.join(topic, peerId).then(
             peers => {
               log(`Joined successfully ${host}`);
               this._topicsJoinedPerSignal.get(host)!.set(topic, peerId);
 
-              log(`Peer candidates changed ${topic} ${peers}`);
-              // TODO(marik-d): Deduplicate peers.
-              this.peerCandidatesChanged.emit([topic, peers]);
+              this._updatePeerCandidates(host, topic, peers)
             },
             err => {
               log(`Join error ${host} ${err.message}`);
@@ -93,6 +96,7 @@ export class WebsocketSignalManager implements SignalManager {
         for (const [topic, peerId] of this._topicsJoinedPerSignal.get(host)!.entries()) {
           if (!this._topicsJoined.has(topic)) {
             log(`Leave ${topic} as ${peerId} on ${host}`);
+            this._peerCandidates.get(host)!.delete(topic);
             promises.push(server.leave(topic, peerId).then(
               () => {
                 log(`Left successfully ${host}`);
@@ -123,12 +127,10 @@ export class WebsocketSignalManager implements SignalManager {
 
   lookup (topic: PublicKey) {
     log(`Lookup ${topic}`);
-    for (const server of this._servers.values()) {
+    for (const [host, server] of this._servers.entries()) {
       server.lookup(topic).then(
         peers => {
-          log(`Peer candidates changed ${topic} ${peers}`);
-          // TODO(marik-d): Deduplicate peers.
-          this.peerCandidatesChanged.emit([topic, peers]);
+          this._updatePeerCandidates(host, topic, peers)
         },
         () => {
           // Error will already be reported in devtools. No need to do anything here.
@@ -137,17 +139,57 @@ export class WebsocketSignalManager implements SignalManager {
     }
   }
 
-  offer (msg: SignalApi.SignalMessage) {
+  private _updatePeerCandidates(host: string, topic: PublicKey, peers: PublicKey[]) {
+    log(`Peer candidates changed ${host} ${topic} ${peers}`);
+    const candidatesSet = this._peerCandidates.get(host)!.get(topic);
+    if(candidatesSet) {
+      candidatesSet.clear();
+      peers.forEach(peer => candidatesSet.add(peer));
+    }
+
+    const allPeers = new ComplexSet<PublicKey>(x => x.toHex());
+    for(const peerMap of this._peerCandidates.values()) {
+      const peers = peerMap.get(topic);
+      if(peers) {
+        for(const peer of peers) {
+          allPeers.add(peer);
+        }
+      }
+    }
+
+    this.peerCandidatesChanged.emit([topic, Array.from(allPeers)]);
+  }
+
+  offer (msg: SignalApi.SignalMessage): Promise<SignalApi.Answer> {
     log(`Offer ${msg.remoteId}`);
-    // TODO(marik-d): Broadcast to all signal servers.
-    return Array.from(this._servers.values())[0].offer(msg);
+    // Send offer to all signal servers, first successful response is returned to the caller.
+    return new Promise((resolve, reject) => {
+      const serverCount = this._servers.size;
+      let errorCount = 0;
+      for(const server of this._servers.values()) {
+        server.offer(msg).then(
+          answer => {
+            log(`Offer answer ${JSON.stringify(answer)}`);
+            // Only first call to resolve is processed.
+            resolve(answer);
+          },
+          error => {
+            log(`Offer error ${error.message}`);
+            if(++errorCount === serverCount) {
+              // Reject if all servers have rejected.
+              reject(error);
+            }
+          }
+        )
+      }
+    })
   }
 
   signal (msg: SignalApi.SignalMessage) {
     log(`Signal ${msg.remoteId}`);
     for (const server of this._servers.values()) {
+      // Error should already be handled by devtools.
       server.signal(msg);
-      // TODO(marik-d): Error handling.
     }
   }
 
